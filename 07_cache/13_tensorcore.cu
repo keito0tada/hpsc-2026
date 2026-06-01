@@ -8,6 +8,21 @@
 using namespace std;
 using namespace nvcuda;
 
+// Transpose B (n×k row-major) → B_T (k×n row-major)
+// so that the GEMM kernel can load B coalesced along the n-dimension
+__global__ void transpose_b(float *out, const float *in, int rows, int cols) {
+  __shared__ float tile[32][33];
+  int row = blockIdx.y * 32 + threadIdx.y;
+  int col = blockIdx.x * 32 + threadIdx.x;
+  if (row < rows && col < cols)
+    tile[threadIdx.y][threadIdx.x] = in[row * cols + col];
+  __syncthreads();
+  int trow = blockIdx.x * 32 + threadIdx.y;
+  int tcol = blockIdx.y * 32 + threadIdx.x;
+  if (trow < cols && tcol < rows)
+    out[trow * rows + tcol] = tile[threadIdx.x][threadIdx.y];
+}
+
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
 		       float *d_a, float *d_b, float *d_c) {
   int offset_a_m = 128 * blockIdx.x;
@@ -29,7 +44,8 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     __syncthreads();
     for (int j = 0; j < 16; ++j) {
       block_a[j][i] = __float2half(d_a[(k + j) * dim_m + offset_a_m + i]);
-      block_b[j][i] = __float2half(d_b[(offset_b_n + i) * dim_k + k + j]);
+      // d_b is B_T (k×n row-major): coalesced along n-dim (stride 1)
+      block_b[j][i] = __float2half(d_b[(k + j) * dim_n + offset_b_n + i]);
     }
     __syncthreads();
     for (int r = 0; r < 4; r++) {
@@ -73,6 +89,14 @@ int main(int argc, const char **argv) {
   for (int i=0; i<n; i++)
     for (int j=0; j<m; j++)
       C[m*i+j] = C2[m*i+j] = 0;
+
+  // Transpose B (n×k) → B_T (k×n) for coalesced access in the GEMM kernel
+  // Cost is one-time and outside the timed region
+  float *B_T;
+  cudaMallocManaged(&B_T, k * n * sizeof(float));
+  transpose_b<<<dim3((k+31)/32, (n+31)/32), dim3(32, 32)>>>(B_T, B, n, k);
+  cudaDeviceSynchronize();
+
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
   auto tic = chrono::steady_clock::now();
@@ -105,7 +129,7 @@ int main(int argc, const char **argv) {
 			      n,
 			      k,
 			      A,
-			      B,
+			      B_T,
 			      C2);
     cudaDeviceSynchronize();
   }
@@ -122,6 +146,7 @@ int main(int argc, const char **argv) {
   printf("error: %lf\n", err/n/m);
   cudaFree(A);
   cudaFree(B);
+  cudaFree(B_T);
   cudaFree(C);
   cudaFree(C2);
   cublasDestroy(cublas_handle);
